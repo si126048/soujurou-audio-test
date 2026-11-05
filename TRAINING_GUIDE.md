@@ -14,6 +14,19 @@
 句首/句末/重音边界标记 `^ $ #` 不在符号表内会被映射为 `UNK`（占 7.8%），
 这是官方 pipeline 的固有行为，底模 s1v3 也是这样训的，不要改。
 
+## 数据准备（阶段 0-3）
+
+本文件的 `train_workflow.py` 从 `all_label.list` 开始，它由 `tools/` 下三个脚本产出：
+
+| 脚本 | 做什么 | 产物 |
+|---|---|---|
+| 官方 `tools/slice_audio.py`（WebUI 0b 面板） | 按静音切段并重采样 32kHz | `slicer/audios/` 2216 段 |
+| `tools/1-quality-gate.py` | 时长 / RMS / 静音比 / 削波闸门，淘汰文件移到 `slicer/rejected/` | `qc_report.csv`，保留 1561 段 |
+| `tools/2-asr-label.py` | faster-whisper large-v3 日语转写 + 幻觉/置信度闸门 | `asr_metrics.csv`，保留 1522 段 |
+| `tools/3-make-report.py` | 合并两份 CSV，写最终标注 | **`all_label.list`** + `dataset_report.csv/.txt` |
+
+阈值、判定逻辑和踩过的坑（faster-whisper 的 CUDA 会因缺 `cublas64_12.dll` 回退 CPU）写在仓库 README 里。
+
 ## 工作流
 
 `train_workflow.py` 把官方 6 步串起来，每步都能单独跑：
@@ -61,7 +74,7 @@ cd D:\ai\GPT-SoVITS
 | 项 | 官方默认 | 本项目 | 原因 |
 |---|---|---|---|
 | s2 epoch | 100 | 10 | 97 分钟数据，官方 WebUI 在 8GB 卡上的默认也是 8 |
-| s2 batch | 32 | 6 | 官方 WebUI 给 8GB 卡的默认就是 4；batch 8 实测峰值 7.8/8.2GB，留余量 |
+| s2 batch | 32 | 6 | 官方 WebUI 给 8GB 卡的默认就是 4；batch 8 实测峰值 7.8/8.2GB，留余量（但见「监控要点」：降到 6 其实没省出多少显存） |
 | s2 步数 | 4800 | 2540 | 计算量降到约 1/2 |
 | s1 epoch | 20 | 10 | |
 | s1 batch | 8 | 8 | 8GB 卡够用，batch 8 兼顾显存和收敛 |
@@ -72,15 +85,14 @@ cd D:\ai\GPT-SoVITS
 学习率不用调：`WarmupCosineLRSchedule.step()` 里写死了 `lr = 0.002`，
 yaml 里的 `lr/warmup_steps/decay_steps` 对 GPT 实际不起作用。
 
-**实测耗时**（RTX 4060 Laptop 8GB，单轮冒烟跑出来的真实数字）：
+**实测耗时**（RTX 4060 Laptop 8GB，正式训练 10 epoch 的真实数字）：
 
-| 阶段 | 实测 | 10 轮合计 |
+| 阶段 | 实测 | 备注 |
 |---|---|---|
-| GPT (s1) | 约 4 分钟/轮 | 约 40 分钟 |
-| SoVITS (s2) | 约 8 分钟/轮（191 步 @2.4s/it，含浏览器抢显存时的抖动） | 约 80 分钟 |
-
-- 预处理 4 步：约 20 分钟（4 进程，实测 630 文件/分钟）
-- **合计约 2.5 小时**（官方默认配置要 5-9 小时）
+| GPT (s1) 10 轮 | **13 分钟** | batch 8 |
+| SoVITS (s2) 10 轮 | **87 分钟** | batch 6，约 8.7 分钟/轮 |
+| 预处理 4 步 | 约 20 分钟 | 4 进程，实测 630 文件/分钟 |
+| **合计** | **约 1 小时 40 分** | 官方默认配置要 5-9 小时 |
 
 训练期间关掉浏览器和 WebUI 能明显省时间——实测 s2 后半程每步从 1.7s 掉到 3.0s，
 就是显存被占满后开始抖动。
@@ -116,10 +128,18 @@ cd D:\ai\GPT-SoVITS
 
 先用训练集里的片段做参考（音色最稳），再用真实录音验证泛化。
 
+脚本化验证走 `eval/`：`tts_test.py`（训练集参考合成 3 句）→ `verify.py`（RMS/峰值 + ASR 回读）
+→ `generalization_test.py`（用 39 段从未训练的切片做参考）→ `generalization_readback.py` → `generalization_ab.py`（A/B 对比）。
+注意 `TTS_Config` 要先构造再改字段（`update_version` / `t2s_weights_path` / `vits_weights_path`），
+传扁平 dict 给构造函数会被忽略；`TTS.run` 是 generator，yield `(sr, int16 ndarray)`。
+
 ## 监控要点
 
-- GPU 温度 < 85°C，笔记本散热有限；`nvidia-smi` 看温度和显存
-- s2 batch 6 实测峰值约 6.5GB；batch 8 会顶到 7.8GB，余量太小
+- GPU 温度 < 85°C，笔记本散热有限；`nvidia-smi dmon -s pucm -d 10 -o TD` 看温度、显存和利用率
+- **显存不是靠降 batch 省出来的**：`dmon` 实测 s2 batch 8 峰值 7841 MiB、batch 6 峰值 8163 MiB（总量 8188），
+  占用由常驻模型和特征缓存主导，batch 只是小头。真要腾显存是关掉同时用 GPU 的程序（浏览器/WebUI），
+  那才是每步从 1.7s 抖到 3.0s 的原因
+- 训练全程 GPU 峰值温度 60°C，笔记本散热无压力
 - 训练日志：`Data/Soujurou/logs_s1_v2ProPlus/`、`logs_s2_v2ProPlus/`
 - 训练中断后重跑同一条命令会从最新 ckpt 续训
 
@@ -159,4 +179,8 @@ Data/Soujurou/
 ---
 
 **最后更新**：2026-11-05
-**状态**：数据就绪；s1 / s2 各跑通 1 轮冒烟（权重落盘正确、配置加载正确）；正式训练待启动
+**状态**：训练完成（s1 + s2 各 10 epoch，12:25→14:06，实际 1 小时 40 分）；泛化测试与 ASR 回读质检通过；
+权重 `Soujurou-e10.ckpt` / `Soujurou_e10_s2540.pth` 已发布在 https://github.com/si126048/soujurou-audio-test
+
+本文件只覆盖阶段 4-6 的训练；阶段 0-3 的素材切片、音频质检、ASR 标注脚本在 `tools/`，
+推理与泛化验证在 `eval/`，完整链路说明见仓库根 README。
